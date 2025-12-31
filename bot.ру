@@ -1,0 +1,283 @@
+# -*- coding: utf-8 -*-
+import logging
+import sqlite3
+import random
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+
+# --- 1. НАСТРОЙКИ И БАЗА ДАННЫХ ---
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Подключаемся к базе данных SQLite (файл bot_data.db создастся автоматически)
+conn = sqlite3.connect('bot_data.db', check_same_thread=False)
+cursor = conn.cursor()
+
+# Создаем таблицы, если их нет
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS words (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    original TEXT,
+    translation TEXT
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS kanji (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    character TEXT,
+    meaning TEXT,
+    reading TEXT
+)
+''')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS grammar (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    pattern TEXT,
+    explanation TEXT
+)
+''')
+conn.commit()
+
+# --- 2. КОМАНДЫ ДЛЯ ДОБАВЛЕНИЯ КАРТОЧЕК ---
+async def add_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /add_word. Формат: слово - перевод"""
+    try:
+        user_id = update.effective_user.id
+        text = update.message.text.replace('/add_word', '').strip()
+        if ' - ' not in text:
+            await update.message.reply_text('❌ Формат: /add_word дом - いえ')
+            return
+        original, translation = text.split(' - ', 1)
+        cursor.execute('INSERT INTO words (user_id, original, translation) VALUES (?, ?, ?)',
+                       (user_id, original.strip(), translation.strip()))
+        conn.commit()
+        await update.message.reply_text(f'✅ Слово добавлено: {original.strip()} -> {translation.strip()}')
+    except Exception as e:
+        await update.message.reply_text('⚠️ Ошибка. Проверь формат: /add_word дом - いえ')
+
+async def add_kanji(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /add_kanji. Формат: 水 - вода, みず"""
+    try:
+        user_id = update.effective_user.id
+        text = update.message.text.replace('/add_kanji', '').strip()
+        if ' - ' not in text:
+            await update.message.reply_text('❌ Формат: /add_kanji 水 - вода, みず')
+            return
+        character, rest = text.split(' - ', 1)
+        if ', ' not in rest:
+            meaning, reading = rest, ''
+        else:
+            meaning, reading = rest.split(', ', 1)
+        cursor.execute('INSERT INTO kanji (user_id, character, meaning, reading) VALUES (?, ?, ?, ?)',
+                       (user_id, character.strip(), meaning.strip(), reading.strip()))
+        conn.commit()
+        await update.message.reply_text(f'✅ Кандзи добавлен: {character.strip()} -> {meaning.strip()}')
+    except Exception as e:
+        await update.message.reply_text('⚠️ Ошибка. Проверь формат: /add_kanji 水 - вода, みず')
+
+async def add_grammar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /add_grammar. Формат: ～ます - вежливая форма глагола"""
+    try:
+        user_id = update.effective_user.id
+        text = update.message.text.replace('/add_grammar', '').strip()
+        if ' - ' not in text:
+            await update.message.reply_text('❌ Формат: /add_grammar ～ます - вежливая форма глагола')
+            return
+        pattern, explanation = text.split(' - ', 1)
+        cursor.execute('INSERT INTO grammar (user_id, pattern, explanation) VALUES (?, ?, ?)',
+                       (user_id, pattern.strip(), explanation.strip()))
+        conn.commit()
+        await update.message.reply_text(f'✅ Грамматика добавлена: {pattern.strip()}')
+    except Exception as e:
+        await update.message.reply_text('⚠️ Ошибка. Проверь формат.')
+
+# --- 3. КОМАНДА ТРЕНИРОВКИ /train ---
+async def train(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запускает тренировку: случайно выбирает тип карточки и задает вопрос"""
+    user_id = update.effective_user.id
+    context.user_data['awaiting_answer'] = False  # Сбрасываем флаг ожидания ответа
+
+    # Собираем все возможные карточки пользователя
+    all_cards = []
+    
+    # Слова
+    cursor.execute('SELECT id, original, translation FROM words WHERE user_id = ?', (user_id,))
+    for row in cursor.fetchall():
+        all_cards.append(('word', row[0], f"Слово: {row[1]}", row[2]))
+    
+    # Кандзи
+    cursor.execute('SELECT id, character, meaning, reading FROM kanji WHERE user_id = ?', (user_id,))
+    for row in cursor.fetchall():
+        display = f"{row[1]} (чтение: {row[3]})" if row[3] else row[1]
+        all_cards.append(('kanji', row[0], f"Кандзи: {display}", row[2]))
+    
+    # Грамматика
+    cursor.execute('SELECT id, pattern, explanation FROM grammar WHERE user_id = ?', (user_id,))
+    for row in cursor.fetchall():
+        all_cards.append(('grammar', row[0], f"Грамматика: {row[1]}", row[2]))
+    
+    if not all_cards:
+        await update.message.reply_text('📭 Колода пуста! Добавь карточки через /add_word, /add_kanji, /add_grammar')
+        return
+    
+    # Выбираем случайную карточку
+    card_type, card_id, question, correct_answer = random.choice(all_cards)
+    
+    # Сохраняем правильный ответ в контексте для проверки
+    context.user_data['correct_answer'] = correct_answer
+    context.user_data['awaiting_answer'] = True
+    context.user_data['card_type'] = card_type
+    
+    # Отправляем вопрос пользователю
+    await update.message.reply_text(f'🎌 ВОПРОС:\n{question}\n\nНапиши ответ:')
+
+# --- 4. ПРОВЕРКА ОТВЕТА ПОЛЬЗОВАТЕЛЯ ---
+async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет ответ пользователя, если мы в режиме тренировки"""
+    if not context.user_data.get('awaiting_answer', False):
+        return  # Не в режиме ожидания ответа
+    
+    user_answer = update.message.text.strip()
+    correct_answer = context.user_data.get('correct_answer', '')
+    card_type = context.user_data.get('card_type', '')
+    
+    # Простая проверка (можно улучшить)
+    is_correct = user_answer.lower() == correct_answer.lower()
+    
+    if is_correct:
+        await update.message.reply_text(f'✅ Правильно! Ответ: {correct_answer}\n\nПродолжить? /train')
+    else:
+        await update.message.reply_text(f'❌ Неверно. Правильный ответ: {correct_answer}\n\nПопробовать ещё? /train')
+    
+    # Сбрасываем флаг ожидания
+    context.user_data['awaiting_answer'] = False
+
+# --- 5. СТАТИСТИКА /stats ---
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику по карточкам"""
+    user_id = update.effective_user.id
+    
+    cursor.execute('SELECT COUNT(*) FROM words WHERE user_id = ?', (user_id,))
+    word_count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM kanji WHERE user_id = ?', (user_id,))
+    kanji_count = cursor.fetchone()[0]
+    
+    cursor.execute('SELECT COUNT(*) FROM grammar WHERE user_id = ?', (user_id,))
+    grammar_count = cursor.fetchone()[0]
+    
+    total = word_count + kanji_count + grammar_count
+    
+    message = f'📊 ТВОЯ СТАТИСТИКА:\n'
+    message += f'• Слов: {word_count}\n'
+    message += f'• Кандзи: {kanji_count}\n'
+    message += f'• Грамм. конструкций: {grammar_count}\n'
+    message += f'• Всего карточек: {total}\n\n'
+    message += f'Продолжаем? /train'
+    
+    await update.message.reply_text(message)
+
+# --- 6. КОМАНДА /start И ГЛАВНОЕ МЕНЮ ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает команду /start и показывает главное меню"""
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить слово", callback_data='add_word_btn')],
+        [InlineKeyboardButton("🔤 Добавить кандзи", callback_data='add_kanji_btn')],
+        [InlineKeyboardButton("📝 Добавить грамматику", callback_data='add_grammar_btn')],
+        [InlineKeyboardButton("🎌 Тренировка", callback_data='train_btn')],
+        [InlineKeyboardButton("📊 Статистика", callback_data='stats_btn')],
+        [InlineKeyboardButton("ℹ️ Помощь", callback_data='help_btn')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_text = """
+    🎌 *Добро пожаловать, самурай!* 
+
+    Я — твой личный учитель японского.
+    С моей помощью ты сможешь:
+    • Сохранять слова, кандзи и грамматику
+    • Тренироваться в любое время
+    • Отслеживать свой прогресс
+
+    *Используй кнопки ниже или команды:*
+    /add_word - Добавить слово (дом - いえ)
+    /add_kanji - Добавить кандзи (水 - вода, みず)
+    /add_grammar - Добавить грамматику (～ます - вежливая форма)
+    /train - Начать тренировку
+    /stats - Показать статистику
+    """
+    
+    await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия кнопок меню"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'add_word_btn':
+        await query.edit_message_text(text="📝 Чтобы добавить слово, отправь:\n`/add_word дом - いえ`", parse_mode='Markdown')
+    elif query.data == 'add_kanji_btn':
+        await query.edit_message_text(text="🔤 Чтобы добавить кандзи, отправь:\n`/add_kanji 水 - вода, みず`", parse_mode='Markdown')
+    elif query.data == 'add_grammar_btn':
+        await query.edit_message_text(text="📖 Чтобы добавить грамматику, отправь:\n`/add_grammar ～ます - вежливая форма глагола`", parse_mode='Markdown')
+    elif query.data == 'train_btn':
+        await train(update, context)  # Используем существующую функцию
+    elif query.data == 'stats_btn':
+        await stats(update, context)  # Используем существующую функцию
+    elif query.data == 'help_btn':
+        help_text = """
+        *📚 ПОМОЩЬ*
+
+        *Добавление карточек:*
+        • Слово: `/add_word дом - いえ`
+        • Кандзи: `/add_kanji 水 - вода, みず`
+        • Грамматика: `/add_grammar ～ます - вежливая форма`
+
+        *Тренировка:*
+        • `/train` - начать тренировку
+        • Отвечай на вопросы текстом
+        • Бот проверит ответ и покажет правильный вариант
+
+        *Статистика:*
+        • `/stats` - посмотреть прогресс
+
+        *Поддержка:*
+        Бот хранит твои данные только для тебя.
+        Все карточки сохраняются автоматически.
+        """
+        await query.edit_message_text(text=help_text, parse_mode='Markdown')
+
+# --- 7. ЗАПУСК БОТА ---
+def main():
+    """Запускает бота"""
+    # ВАЖНО: Токен от @BotFather нужно будет вставить НА ХОСТИНГЕ, в переменную окружения 'BOT_TOKEN'
+    # Сейчас здесь стоит заглушка. На Render.com вы создадите переменную BOT_TOKEN со своим настоящим токеном.
+    
+    # Замените 'YOUR_BOT_TOKEN' на переменную окружения
+    TOKEN = 'YOUR_BOT_TOKEN'  # Это заглушка! На Render.com заменится на os.environ['BOT_TOKEN']
+    
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('add_word', add_word))
+    application.add_handler(CommandHandler('add_kanji', add_kanji))
+    application.add_handler(CommandHandler('add_grammar', add_grammar))
+    application.add_handler(CommandHandler('train', train))
+    application.add_handler(CommandHandler('stats', stats))
+    
+    # Регистрируем обработчики кнопок и текстовых сообщений
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
+    
+    # Запускаем бота
+    logger.info("Бот 'Самурай Учитель' запущен!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
